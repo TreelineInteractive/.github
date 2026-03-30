@@ -42,16 +42,16 @@ jobs:
       - name: Solve issue with Claude
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
         run: |
-          claude -p \
-            --model claude-sonnet-4-6 \
-            --allowedTools "Read,Write,Edit,Bash,Glob,Grep" \
-            "You are a software engineer working on a GitHub repository. Your job is to fix the following issue.
+          PROMPT="You are a software engineer working on a GitHub repository. Your job is to fix the following issue.
 
-          Issue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}
+          Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}
 
           ---
-          ${{ github.event.issue.body }}
+          ${ISSUE_BODY}
           ---
 
           Instructions:
@@ -61,6 +61,10 @@ jobs:
           - Write clean, idiomatic code that matches the existing style
           - If there are tests, make sure they pass
           - Do not open a PR — that will be handled automatically after you're done"
+
+          echo "$PROMPT" | claude -p \
+            --model claude-sonnet-4-6 \
+            --allowedTools "Read,Write,Edit,Bash,Glob,Grep"
 
       - name: Check for uncommitted changes
         id: changes
