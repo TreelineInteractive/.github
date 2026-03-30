@@ -1,0 +1,12 @@
+name: Claude Issue Solver
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  solve:
+    if: github.event.label.name == 'claude'
+    uses: TreelineInteractive/.github/.github/workflows/claude-issue-solver.yml@main
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
