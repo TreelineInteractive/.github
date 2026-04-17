@@ -5,10 +5,6 @@ on:
     secrets:
       ANTHROPIC_API_KEY:
         required: true
-      USERNAME_ADMIN:
-        required: false
-      PASSWORD_ADMIN:
-        required: false
 
 jobs:
   solve:
@@ -33,35 +29,108 @@ jobs:
 
       - name: Configure git
         run: |
-          git config user.name "claude-agent"
+          git config user.name  "claude-agent"
           git config user.email "claude-agent@users.noreply.github.com"
 
-      - name: Create branch
+      - name: Resolve target branch
         id: branch
+        env:
+          GH_TOKEN:       ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER:   ${{ github.event.issue.number }}
+          IS_PR_COMMENT:  ${{ github.event.issue.pull_request != null }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          BRANCH="claude/issue-${{ github.event.issue.number }}"
-          git checkout -b "$BRANCH"
-          echo "name=$BRANCH" >> $GITHUB_OUTPUT
+          set -euo pipefail
 
-      - name: Comment on issue — starting
+          if [ "$IS_PR_COMMENT" = "true" ]; then
+            BRANCH=$(gh pr view "$ISSUE_NUMBER" --json headRefName -q .headRefName)
+            MODE="pr-iteration"
+          else
+            BRANCH="claude/issue-${ISSUE_NUMBER}"
+            if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+              MODE="issue-iteration"
+            else
+              MODE="issue-fresh"
+            fi
+          fi
+
+          if [ "$MODE" = "issue-fresh" ]; then
+            git checkout -b "$BRANCH"
+          else
+            git fetch origin "$BRANCH"
+            git checkout "$BRANCH"
+          fi
+
+          echo "name=$BRANCH" >> $GITHUB_OUTPUT
+          echo "mode=$MODE"   >> $GITHUB_OUTPUT
+
+      - name: Ack on issue/PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MODE:     ${{ steps.branch.outputs.mode }}
+          BRANCH:   ${{ steps.branch.outputs.name }}
         run: |
-          gh issue comment ${{ github.event.issue.number }} \
-            --body "🤖 **Claude is on it.** Working on a fix now — will open a PR when done."
+          case "$MODE" in
+            issue-fresh)     MSG="🤖 **Claude is on it.** Working on a fix now — will open a PR when done." ;;
+            issue-iteration) MSG="🤖 **Claude is picking up where we left off** on \`$BRANCH\` — will push updates to the existing PR." ;;
+            pr-iteration)    MSG="🤖 **Claude is addressing your feedback** on \`$BRANCH\`." ;;
+          esac
+          gh issue comment ${{ github.event.issue.number }} --body "$MSG"
+
+      - name: Gather conversation context
+        id: ctx
+        env:
+          GH_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          REPO:          ${{ github.repository }}
+          ISSUE_NUMBER:  ${{ github.event.issue.number }}
+          IS_PR_COMMENT: ${{ github.event.issue.pull_request != null }}
+          MODE:          ${{ steps.branch.outputs.mode }}
+        run: |
+          set -euo pipefail
+          OUT=/tmp/claude-ctx.md
+          : > "$OUT"
+
+          if [ "$MODE" = "issue-fresh" ]; then
+            echo "(first run — no prior conversation)" > "$OUT"
+          else
+            if [ "$IS_PR_COMMENT" = "true" ]; then
+              echo "# PR #$ISSUE_NUMBER"           >> "$OUT"
+              gh pr view "$ISSUE_NUMBER" --json title,body \
+                --jq '"## Title\n\(.title)\n\n## Description\n\(.body // "")"'              >> "$OUT"
+              echo                                                                          >> "$OUT"
+              echo "## PR conversation comments"                                             >> "$OUT"
+              gh pr view "$ISSUE_NUMBER" --json comments \
+                --jq '.comments[] | "\n### @\(.author.login) — \(.createdAt)\n\(.body)"'    >> "$OUT"
+              echo                                                                          >> "$OUT"
+              echo "## PR reviews"                                                           >> "$OUT"
+              gh pr view "$ISSUE_NUMBER" --json reviews \
+                --jq '.reviews[]  | "\n### @\(.author.login) (\(.state)) — \(.submittedAt)\n\(.body // "")"' >> "$OUT"
+              echo                                                                          >> "$OUT"
+              echo "## Inline review comments (file:line)"                                   >> "$OUT"
+              gh api "repos/$REPO/pulls/$ISSUE_NUMBER/comments" \
+                --jq '.[] | "\n### @\(.user.login) on \(.path):\(.line // .original_line)\n\(.body)"' >> "$OUT"
+            else
+              echo "# Issue #$ISSUE_NUMBER"        >> "$OUT"
+              gh issue view "$ISSUE_NUMBER" --json title,body \
+                --jq '"## Title\n\(.title)\n\n## Description\n\(.body // "")"'              >> "$OUT"
+              echo                                                                          >> "$OUT"
+              echo "## Issue comments"                                                       >> "$OUT"
+              gh issue view "$ISSUE_NUMBER" --json comments \
+                --jq '.comments[] | "\n### @\(.author.login) — \(.createdAt)\n\(.body)"'    >> "$OUT"
+            fi
+          fi
+
+          echo "file=$OUT" >> $GITHUB_OUTPUT
 
       - name: Boot app stack (if repo provides stack-up.sh)
         id: stack
         if: hashFiles('scripts/stack-up.sh') != ''
-        env:
-          USERNAME_ADMIN: ${{ secrets.USERNAME_ADMIN }}
-          PASSWORD_ADMIN: ${{ secrets.PASSWORD_ADMIN }}
         run: |
           ./scripts/stack-up.sh
           echo "up=true" >> $GITHUB_OUTPUT
 
       - name: Write Playwright MCP config
-        if: hashFiles('scripts/stack-up.sh') != ''
+        if: steps.stack.outputs.up == 'true'
         run: |
           mkdir -p .claude-agent
           cat > .claude-agent/mcp.json <<'JSON'
@@ -75,32 +144,42 @@ jobs:
           }
           JSON
 
-      - name: Solve issue with Claude
+      - name: Solve / iterate with Claude
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          ISSUE_TITLE: ${{ github.event.issue.title }}
-          ISSUE_BODY: ${{ github.event.issue.body }}
-          FRONTEND_URL: http://localhost:5173
-          USERNAME_ADMIN: ${{ secrets.USERNAME_ADMIN }}
-          PASSWORD_ADMIN: ${{ secrets.PASSWORD_ADMIN }}
-          STACK_UP: ${{ steps.stack.outputs.up }}
+          ISSUE_NUMBER:   ${{ github.event.issue.number }}
+          ISSUE_TITLE:    ${{ github.event.issue.title }}
+          ISSUE_BODY:     ${{ github.event.issue.body }}
+          MODE:           ${{ steps.branch.outputs.mode }}
+          BRANCH:         ${{ steps.branch.outputs.name }}
+          CTX_FILE:       ${{ steps.ctx.outputs.file }}
+          STACK_UP:       ${{ steps.stack.outputs.up }}
         run: |
+          set -euo pipefail
+
           STACK_CONTEXT=""
           MCP_FLAGS=""
           TOOLS="Read,Write,Edit,Bash,Glob,Grep"
-          if [[ "$STACK_UP" == "true" ]]; then
+          if [ "$STACK_UP" = "true" ]; then
+            # Repos can populate .claude-agent/runtime.md during stack-up
+            # with URLs, login info, and any other agent-facing context.
+            RUNTIME_MD=""
+            if [ -f .claude-agent/runtime.md ]; then
+              RUNTIME_MD="$(cat .claude-agent/runtime.md)"
+            fi
             STACK_CONTEXT="
 
-          The app stack is running locally on this machine:
-          - Frontend: $FRONTEND_URL
-          - Admin login: $USERNAME_ADMIN / $PASSWORD_ADMIN
-          You have Playwright MCP tools (mcp__playwright__*) — drive a real browser to reproduce the issue, verify your fix, and capture screenshots when helpful."
+          The app stack is running locally on this runner. You have Playwright MCP tools (mcp__playwright__*).
+          Drive a real browser to reproduce the issue, verify your fix, and capture screenshots when helpful.
+          ${RUNTIME_MD}"
             MCP_FLAGS="--mcp-config .claude-agent/mcp.json"
             TOOLS="$TOOLS,mcp__playwright__*"
           fi
 
-          PROMPT="You are a software engineer working on a GitHub repository. Your job is to fix the following issue.
+          CONTEXT_MD=$(cat "$CTX_FILE")
+
+          if [ "$MODE" = "issue-fresh" ]; then
+            PROMPT="You are a software engineer working on a GitHub repository. Your job is to fix the following issue.
 
           Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}
 
@@ -112,10 +191,29 @@ jobs:
           Instructions:
           - Explore the codebase to understand the structure and relevant code
           - Make the necessary changes to fix the issue
-          - Commit your changes frequently as you work using 'git add -A && git commit -m \"<message>\"' so progress is saved and a developer can take over if needed
-          - Write clean, idiomatic code that matches the existing style
+          - Commit frequently with 'git add -A && git commit -m \"<message>\"' so progress is saved and a developer can take over if needed
+          - Match the existing code style
           - If there are tests, make sure they pass
-          - Do not open a PR — that will be handled automatically after you're done"
+          - Do not open a PR — that will be handled automatically"
+          else
+            PROMPT="You are iterating on in-progress work.
+
+          Branch \`${BRANCH}\` already contains prior commits. Inspect them first with \`git log --oneline -20\` and \`git diff origin/HEAD...HEAD\` before changing anything.
+
+          **Apply the delta requested in the most recent feedback below. Do NOT redo the existing implementation.**
+
+          Conversation context:
+
+          ${CONTEXT_MD}
+          ${STACK_CONTEXT}
+
+          Instructions:
+          - The latest comment is the feedback you must address
+          - Keep changes focused on that feedback — no drive-by refactors
+          - Commit with 'git add -A && git commit -m \"<message>\"'
+          - If the feedback is unclear, add a comment on the issue/PR asking for clarification rather than guessing
+          - Do not open/update the PR — that is handled automatically"
+          fi
 
           echo "$PROMPT" | claude -p \
             --model claude-sonnet-4-6 \
@@ -126,20 +224,19 @@ jobs:
         if: always() && steps.stack.outputs.up == 'true'
         run: ./scripts/stack-down.sh || true
 
-      - name: Check for uncommitted changes
+      - name: Check for changes
         id: changes
         run: |
           git add -A
           if git diff --staged --quiet; then
-            # Check if any commits were made on this branch vs base
             COMMITS=$(git rev-list HEAD ^origin/${{ github.event.repository.default_branch }} --count 2>/dev/null || echo "0")
             if [ "$COMMITS" -gt "0" ]; then
-              echo "has_changes=true" >> $GITHUB_OUTPUT
+              echo "has_changes=true"  >> $GITHUB_OUTPUT
             else
               echo "has_changes=false" >> $GITHUB_OUTPUT
             fi
           else
-            git commit -m "chore: final staged changes from Claude"
+            git commit -m "chore: staged changes from Claude"
             echo "has_changes=true" >> $GITHUB_OUTPUT
           fi
 
@@ -147,8 +244,8 @@ jobs:
         if: steps.changes.outputs.has_changes == 'true'
         run: git push origin "${{ steps.branch.outputs.name }}"
 
-      - name: Create PR
-        if: steps.changes.outputs.has_changes == 'true'
+      - name: Open PR (only on first run)
+        if: steps.changes.outputs.has_changes == 'true' && steps.branch.outputs.mode == 'issue-fresh'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -159,12 +256,26 @@ jobs:
           ---
           🤖 Automatically generated by [Claude Sonnet](https://anthropic.com) via the \`claude\` label.
 
-          Branch \`${{ steps.branch.outputs.name }}\` is available to check out and continue work if needed." \
+          Branch \`${{ steps.branch.outputs.name }}\` is available to check out and continue work if needed.
+          Comment with \`@claude <feedback>\` to request changes." \
             --head "${{ steps.branch.outputs.name }}" \
             --base "${{ github.event.repository.default_branch }}"
 
-      - name: Comment — no changes
-        if: steps.changes.outputs.has_changes == 'false'
+      - name: Ack iteration result
+        if: steps.branch.outputs.mode != 'issue-fresh'
+        env:
+          GH_TOKEN:    ${{ secrets.GITHUB_TOKEN }}
+          HAS_CHANGES: ${{ steps.changes.outputs.has_changes }}
+        run: |
+          if [ "$HAS_CHANGES" = "true" ]; then
+            MSG="🤖 **Claude pushed updates** to \`${{ steps.branch.outputs.name }}\`. Review the PR for the delta."
+          else
+            MSG="🤖 **Claude didn't make any changes** this round — possibly didn't understand the feedback. Try adding more detail and comment \`@claude\` again."
+          fi
+          gh issue comment ${{ github.event.issue.number }} --body "$MSG"
+
+      - name: Ack — no changes (first run)
+        if: steps.changes.outputs.has_changes == 'false' && steps.branch.outputs.mode == 'issue-fresh'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
