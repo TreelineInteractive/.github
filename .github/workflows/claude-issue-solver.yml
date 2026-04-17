@@ -5,10 +5,14 @@ on:
     secrets:
       ANTHROPIC_API_KEY:
         required: true
+      USERNAME_ADMIN:
+        required: false
+      PASSWORD_ADMIN:
+        required: false
 
 jobs:
   solve:
-    runs-on: self-hosted
+    runs-on: [self-hosted, macOS, X64]
     permissions:
       contents: write
       pull-requests: write
@@ -82,6 +86,14 @@ jobs:
             git commit -m "chore: final staged changes from Claude"
             echo "has_changes=true" >> $GITHUB_OUTPUT
           fi
+
+      - name: Run agent verification gate
+        if: steps.changes.outputs.has_changes == 'true' && hashFiles('scripts/agent-verify.sh') != ''
+        env:
+          CLAUDE_AGENT_MODE: '1'
+          USERNAME_ADMIN: ${{ secrets.USERNAME_ADMIN }}
+          PASSWORD_ADMIN: ${{ secrets.PASSWORD_ADMIN }}
+        run: ./scripts/agent-verify.sh
 
       - name: Push branch
         if: steps.changes.outputs.has_changes == 'true'
