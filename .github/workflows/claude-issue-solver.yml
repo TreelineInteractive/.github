@@ -259,7 +259,8 @@ jobs:
           Branch \`${{ steps.branch.outputs.name }}\` is available to check out and continue work if needed.
           Comment with \`@claude <feedback>\` to request changes." \
             --head "${{ steps.branch.outputs.name }}" \
-            --base "${{ github.event.repository.default_branch }}"
+            --base "${{ github.event.repository.default_branch }}" \
+            --label "claude"
 
       - name: Ack iteration result
         if: steps.branch.outputs.mode != 'issue-fresh'
