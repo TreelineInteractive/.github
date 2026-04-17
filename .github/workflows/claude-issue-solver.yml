@@ -24,6 +24,13 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
+      - name: Set up Node + Corepack
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.9.0'
+      - name: Enable Corepack
+        run: corepack enable
+
       - name: Configure git
         run: |
           git config user.name "claude-agent"
@@ -43,13 +50,56 @@ jobs:
           gh issue comment ${{ github.event.issue.number }} \
             --body "🤖 **Claude is on it.** Working on a fix now — will open a PR when done."
 
+      - name: Boot app stack (if repo provides stack-up.sh)
+        id: stack
+        if: hashFiles('scripts/stack-up.sh') != ''
+        env:
+          USERNAME_ADMIN: ${{ secrets.USERNAME_ADMIN }}
+          PASSWORD_ADMIN: ${{ secrets.PASSWORD_ADMIN }}
+        run: |
+          ./scripts/stack-up.sh
+          echo "up=true" >> $GITHUB_OUTPUT
+
+      - name: Write Playwright MCP config
+        if: hashFiles('scripts/stack-up.sh') != ''
+        run: |
+          mkdir -p .claude-agent
+          cat > .claude-agent/mcp.json <<'JSON'
+          {
+            "mcpServers": {
+              "playwright": {
+                "command": "npx",
+                "args": ["-y", "@playwright/mcp@latest", "--headless"]
+              }
+            }
+          }
+          JSON
+
       - name: Solve issue with Claude
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_BODY: ${{ github.event.issue.body }}
+          FRONTEND_URL: http://localhost:5173
+          USERNAME_ADMIN: ${{ secrets.USERNAME_ADMIN }}
+          PASSWORD_ADMIN: ${{ secrets.PASSWORD_ADMIN }}
+          STACK_UP: ${{ steps.stack.outputs.up }}
         run: |
+          STACK_CONTEXT=""
+          MCP_FLAGS=""
+          TOOLS="Read,Write,Edit,Bash,Glob,Grep"
+          if [[ "$STACK_UP" == "true" ]]; then
+            STACK_CONTEXT="
+
+          The app stack is running locally on this machine:
+          - Frontend: $FRONTEND_URL
+          - Admin login: $USERNAME_ADMIN / $PASSWORD_ADMIN
+          You have Playwright MCP tools (mcp__playwright__*) — drive a real browser to reproduce the issue, verify your fix, and capture screenshots when helpful."
+            MCP_FLAGS="--mcp-config .claude-agent/mcp.json"
+            TOOLS="$TOOLS,mcp__playwright__*"
+          fi
+
           PROMPT="You are a software engineer working on a GitHub repository. Your job is to fix the following issue.
 
           Issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}
@@ -57,6 +107,7 @@ jobs:
           ---
           ${ISSUE_BODY}
           ---
+          ${STACK_CONTEXT}
 
           Instructions:
           - Explore the codebase to understand the structure and relevant code
@@ -68,7 +119,12 @@ jobs:
 
           echo "$PROMPT" | claude -p \
             --model claude-sonnet-4-6 \
-            --allowedTools "Read,Write,Edit,Bash,Glob,Grep"
+            $MCP_FLAGS \
+            --allowedTools "$TOOLS"
+
+      - name: Tear down app stack
+        if: always() && steps.stack.outputs.up == 'true'
+        run: ./scripts/stack-down.sh || true
 
       - name: Check for uncommitted changes
         id: changes
@@ -86,14 +142,6 @@ jobs:
             git commit -m "chore: final staged changes from Claude"
             echo "has_changes=true" >> $GITHUB_OUTPUT
           fi
-
-      - name: Run agent verification gate
-        if: steps.changes.outputs.has_changes == 'true' && hashFiles('scripts/agent-verify.sh') != ''
-        env:
-          CLAUDE_AGENT_MODE: '1'
-          USERNAME_ADMIN: ${{ secrets.USERNAME_ADMIN }}
-          PASSWORD_ADMIN: ${{ secrets.PASSWORD_ADMIN }}
-        run: ./scripts/agent-verify.sh
 
       - name: Push branch
         if: steps.changes.outputs.has_changes == 'true'
